@@ -2,28 +2,36 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import koreanize_matplotlib
-import seaborn as sns
 
-import datetime
-
-from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
 
 import preprocess
+import analysis
 
 BASE = preprocess.BASE
+
+START_YEAR, END_YEAR = 2000, 2025   # 분석 기간 (2026년은 올해 예측 비교용으로 제외)
+DAYS_PER_YEAR = 14                  # 11월 8~21일
+TRAIN_END = 2019                    # 2000~2019년 학습, 2020~2025년 검증
 
 
 def main():
     """메인 파이프라인"""
-    temp, co2, oni, suneung_temp = load_data()  # 데이터 불러오기
-    
-    temp.info()
-    co2.info()
-    oni.info()
+    temp, co2, oni, suneung_temp = load_data()
 
-    visualize(temp, co2, oni, suneung_temp)
+    # 그래프 그리기 (추세, ONI 산점도, ENSO 상자그림, CO2, 수능 당일 상관)
+    analysis.analyze(temp, co2, oni, suneung_temp)
+
+    data = make_dataset(temp, co2, oni)
+
+    # 1) 전체 기간 회귀: 보고서에 쓸 a, b, R²
+    print('[전체 기간 회귀 2000~2025]')
+    fit_temp_regression(data)
+
+    # 2) 검증: 2000~2019년으로 학습 → 2020~2025년 예측
+    print(f'\n[검증 {START_YEAR}~{TRAIN_END} 학습 → {TRAIN_END + 1}~{END_YEAR} 예측]')
+    validate_temp_regression(data)
 
 
 def load_data():
@@ -38,125 +46,85 @@ def load_data():
         suneung_temp = preprocess.make_suneung_temp(BASE)
 
     temp['date'] = pd.to_datetime(temp['date'])
-    temp = temp[temp['date'].dt.year <= 2025]
-    
+    temp = temp[temp['date'].dt.year.between(START_YEAR, END_YEAR)]
+    suneung_temp = suneung_temp[suneung_temp['year'].between(START_YEAR, END_YEAR)]
+
     return temp, co2, oni, suneung_temp
 
 
-def visualize(temp: pd.DataFrame, co2: pd.DataFrame, oni: pd.DataFrame, suneung_temp: pd.DataFrame):
-    """데이터 시각화"""
-    # 연도별 수능 기간(11월 8~21일) 최저 기온 평균
-    temp_yr = temp.groupby(temp['date'].dt.year)['temp_min'].mean()
-    plt.plot(temp_yr.index, temp_yr, marker='o', label='관측값')
-    a, b = np.polyfit(temp_yr.index, temp_yr, 1)
-    plt.plot(temp_yr.index, a * temp_yr.index + b, color='#d9534f',
-             linestyle='--', label=f'추세선 ({a * 10:+.2f} ℃/10년)')
-    plt.xlabel('연도')
-    plt.ylabel('11월 8~21일 평균 최저 기온 (℃)')
-    plt.title('수능 시기 서울 평균 최저 기온')
-    plt.legend(fontsize=9)
-    plt.grid(alpha=0.3)
-    plt.savefig(BASE / 'figures/temp_yr_trend.svg', bbox_inches='tight')
-    plt.close()
+def make_dataset(temp: pd.DataFrame, co2: pd.DataFrame, oni: pd.DataFrame) -> pd.DataFrame:
+    """연도별 수능 시기 기온, CO2, ONI(ASO)를 한 표로 합치기"""
+    yearly = temp.groupby(temp['date'].dt.year)['temp_min'].agg(['mean', 'count'])
+    yearly = yearly.loc[START_YEAR:END_YEAR]
+    assert (yearly['count'] == DAYS_PER_YEAR).all(), '14일이 다 안 채워진 연도가 있음'
 
-    # ONI와 연도별 수능 기간 최저 기온 평균 산점도
-    aso = oni.set_index('year')['aso'].loc[temp_yr.index]   # temp_yr과 같은 연도만, 같은 순서로
+    data = pd.DataFrame({
+        'temp': yearly['mean'],
+        'co2': co2.set_index('year')['co2'],
+        'oni': oni.set_index('year')['aso'],
+    }).loc[yearly.index].rename_axis('year')
+    assert data.notna().all().all(), '비어 있는 값이 있음'
+    return data
 
+
+def fit_temp_regression(data: pd.DataFrame) -> LinearRegression:
+    """수능 시기 기온 = a·CO2 + b·ONI + 상수 (넘겨받은 기간 전체로 학습)"""
+    X = data.drop(columns='temp')
+    y = data['temp']
+
+    model = LinearRegression().fit(X, y)
+
+    coef = pd.Series(model.coef_, index=X.columns)
+    print(f"a(CO2) = {coef['co2']:.3f} ℃/ppm")
+    print(f"b(ONI) = {coef['oni']:.3f} ℃")
+    print(f'상수   = {model.intercept_:.2f} ℃')
+    print(f'R²     = {model.score(X, y):.3f}')
+
+    return model
+
+
+def validate_temp_regression(data: pd.DataFrame) -> LinearRegression:
+    """학습 기간으로 모델을 만들고 검증 기간을 예측해 실제값과 비교하기"""
+    train, test = data.loc[:TRAIN_END], data.loc[TRAIN_END + 1:]
+    X_test = test.drop(columns='temp')
+    y_test = test['temp']
+
+    # 학습 기간 데이터로만 모델 만들기
+    model = fit_temp_regression(train)
+
+    # 검증 기간 기온 예측하기
+    y_pred = pd.Series(model.predict(X_test), index=y_test.index)
+
+    # R²와 RMSE로 평가하고, 학습 기간 평균값을 찍었을 때와 비교하기
+    r2 = r2_score(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    baseline = np.full(len(y_test), train['temp'].mean())
+    base_rmse = np.sqrt(mean_squared_error(y_test, baseline))
+    print(f'검증 R² = {r2:.3f}')
+    print(f'검증 RMSE = {rmse:.1f} ℃ (학습 기간 평균값만 쓴 경우 RMSE = {base_rmse:.1f} ℃)')
+    print(pd.DataFrame({'실제': y_test, '예측': y_pred}).round(2))
+
+    # 실제값과 예측값 시각화
     fig, ax = plt.subplots()
-    ax.scatter(aso, temp_yr, color='black', zorder=3)
-    a, b = np.polyfit(aso, temp_yr, 1)
-    ax.plot(aso.sort_values(), a * aso.sort_values() + b,
-            color='#7b3fa0', linestyle='--', linewidth=1.5, label='추세선')
-    r = np.corrcoef(aso, temp_yr)[0, 1]
-    ax.text(0.03, 0.95, f'r = {r:.2f}', transform=ax.transAxes,
-            fontsize=11, verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    ax.scatter(y_test, y_pred, zorder=3)
+    for year in y_test.index:
+        ax.annotate(year, (y_test[year], y_pred[year]),
+                    textcoords='offset points', xytext=(5, 5), fontsize=8)
 
-    xmin, xmax = ax.get_xlim()
-    ax.set_xlim(xmin, xmax)
+    min_v = min(y_test.min(), y_pred.min())
+    max_v = max(y_test.max(), y_pred.max())
+    ax.plot([min_v, max_v], [min_v, max_v], color='#d9534f', linestyle='--', label='실제 = 예측')
 
-    ax.axvspan(xmin, -0.5, color='#4a7fd4', alpha=0.12, label='라니냐')
-    ax.axvspan(-0.5, 0.5, color='#999999', alpha=0.12, label='평상시')
-    ax.axvspan(0.5, xmax, color='#d9534f', alpha=0.12, label='엘니뇨')
-
-    ax.axvline(-0.5, color='gray', linestyle=':', linewidth=1)
-    ax.axvline(0.5, color='gray', linestyle=':', linewidth=1)
-
-    ax.legend(loc='lower left', fontsize=9)
-    ax.set_xlabel('ONI (8~10월)')
-    ax.set_ylabel('수능 시기 평균 최저 기온 (℃)')
-    ax.set_title('ONI와 수능 시기 평균 최저 기온')
-    fig.savefig(BASE / 'figures/scatter_oni.svg', bbox_inches='tight')
+    ax.set_xlabel('실제 수능 시기 평균 최저 기온 (℃)')
+    ax.set_ylabel('예측 수능 시기 평균 최저 기온 (℃)')
+    ax.set_title(f'실제 기온과 예측 기온 ({TRAIN_END + 1}~{END_YEAR}년)')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    fig.savefig(BASE / 'figures/validation.svg', bbox_inches='tight')
     plt.close(fig)
 
-    # 엘니뇨·라니냐·평상시 해별 수능 시기 평균 최저 기온 비교
-    phase = pd.Series(np.select([aso <= -0.5, aso >= 0.5], ['라니냐', '엘니뇨'], default='평상시'),
-                      index=aso.index)
-    order = ['라니냐', '평상시', '엘니뇨']
-    df = pd.DataFrame({'phase': phase, 'temp': temp_yr})
-    print(df.groupby('phase')['temp'].describe().loc[order].round(2))
+    return model
 
-    fig, ax = plt.subplots()
-    sns.boxplot(data=df, x='phase', y='temp', order=order, hue='phase', hue_order=order,
-                palette=['#4a7fd4', '#999999', '#d9534f'], boxprops={'alpha': 0.5},
-                showfliers=False, legend=False, ax=ax)
-    np.random.seed(42)
-    sns.stripplot(data=df, x='phase', y='temp', order=order, color='black', size=5, jitter=0.1, ax=ax)
-    ax.set_xlabel('')
-    ax.set_ylabel('수능 시기 평균 최저 기온 (℃)')
-    ax.set_title('엘니뇨·라니냐 해별 수능 시기 평균 최저 기온')
-    ax.grid(axis='y', alpha=0.3)
-    fig.savefig(BASE / 'figures/box_enso.svg', bbox_inches='tight')
-    plt.close(fig)
-
-    # 연도별 CO2 농도 변화
-    plt.plot(co2['year'], co2['co2'], marker='o', label='관측값')
-    a, b = np.polyfit(co2['year'], co2['co2'], 1)
-    plt.plot(co2['year'], a * co2['year'] + b, color='#d9534f',
-             linestyle='--', label=f'추세선 ({a * 10:+.1f} ppm/10년)')
-    plt.xlabel('연도')
-    plt.ylabel('이산화 탄소 농도 (ppm)')
-    plt.title('연도별 이산화 탄소 농도 변화')
-    plt.legend(fontsize=9)
-    plt.grid(alpha=0.3)
-    plt.savefig(BASE / 'figures/co2_trend.svg', bbox_inches='tight')
-    plt.close()
-
-    # 실제 수능 당일 최저 기온과 수능 기간으로 잡은 기간(11월 8~21일) 사이의 상관관계
-    y = suneung_temp.set_index('year')['temp_min']
-    x = temp_yr.loc[y.index]
-
-    plt.scatter(x, y, marker='o')
-    a, b = np.polyfit(x, y, 1)
-    plt.plot(x.sort_values(), a * x.sort_values() + b, color='#d9534f')
-    r = np.corrcoef(x, y)[0, 1]
-    plt.text(0.03, 0.95, f'r = {r:.2f}', transform=plt.gca().transAxes,
-             fontsize=11, verticalalignment='top',
-             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    plt.xlabel('수능 시기 평균 최저 기온 (℃)')
-    plt.ylabel('실제 수능 날의 최저 기온 (℃)')
-    plt.title('수능 당일 최저 기온과 수능 시기 평균 최저 기온')
-    plt.grid(alpha=0.3)
-    plt.savefig(BASE / 'figures/scatter_suneung.svg', bbox_inches='tight')
-    plt.close()
-
-    # 수능 기간으로 잡은 기간(11월 8~21일)과 
-    y = suneung_temp.set_index('year')['temp_min']
-    x = temp_yr.loc[y.index]
-
-    plt.scatter(x, y, marker='o')
-    a, b = np.polyfit(x, y, 1)
-    plt.plot(x.sort_values(), a * x.sort_values() + b, color='#d9534f')
-    r = np.corrcoef(x, y)[0, 1]
-    plt.text(0.03, 0.95, f'r = {r:.2f}', transform=plt.gca().transAxes,
-             fontsize=11, verticalalignment='top',
-             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-    plt.xlabel('수능 시기 평균 최저 기온 (℃)')
-    plt.ylabel('실제 수능 날의 최저 기온 (℃)')
-    plt.title('수능 당일 최저 기온과 수능 시기 평균 최저 기온')
-    plt.grid(alpha=0.3)
-    plt.savefig(BASE / 'figures/scatter_suneung.svg', bbox_inches='tight')
-    plt.close()
 
 if __name__ == '__main__':
     main()
